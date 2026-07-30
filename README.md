@@ -1,13 +1,22 @@
-# adds-mcp
+# hg-directory-mcp
 
-A **read-only** Model Context Protocol server for Active Directory. Designed for
-monitoring and investigation workflows: it exposes users, groups, OUs, computers,
-GPOs, and domain metadata as MCP tools an LLM agent can query safely.
+A pair of **read-only** MCP servers for monitoring and investigation of a
+Microsoft directory + PKI environment:
 
-The server binds to LDAPS with a dedicated least-privilege service account, uses
-only `SEARCH` operations, and refuses to expose any mutating LDAP verbs.
+| Server        | Purpose                                             | Data sources                    | Default port |
+|---------------|-----------------------------------------------------|---------------------------------|--------------|
+| `adds-mcp`    | Active Directory Domain Services (users, groups, OUs, computers, GPOs, domain metadata) | LDAPS to any DC                 | 8080         |
+| `adcs-mcp`    | Active Directory Certificate Services (CAs, templates, trust anchors, issued certs)     | LDAPS (AD PKI subtree) + WinRM to each online issuing CA | 8081         |
 
-## What it can query
+Both servers refuse to mutate anything: `adds-mcp` opens LDAP with
+`read_only=True` and neither exposes any tool that accepts a write. `adcs-mcp`
+runs only `Get-*` and read-only registry reads on the CA hosts.
+
+---
+
+## `adds-mcp` — Active Directory
+
+35 read-only tools grouped by object type:
 
 | Domain               | Tools                                                                                                                                    |
 |----------------------|------------------------------------------------------------------------------------------------------------------------------------------|
@@ -19,93 +28,129 @@ only `SEARCH` operations, and refuses to expose any mutating LDAP verbs.
 | Domain / directory   | `get_domain_info`, `get_password_policy`, `list_fine_grained_password_policies`, `list_fsmo_roles`, `list_trusts`, `list_sites`          |
 | Escape hatch         | `ldap_search` (raw filter), `get_object_by_dn`, `count_objects`                                                                          |
 
-Every attribute is decoded before it leaves the tool:
+Every attribute is decoded before it leaves the tool: SIDs, GUIDs, FILETIMEs,
+`userAccountControl`, `groupType`, tick-interval durations, and `gPLink`.
 
-- `objectSid` → `S-1-5-21-...` strings
-- `objectGUID` → canonical GUID strings
-- `lastLogonTimestamp`, `pwdLastSet`, `accountExpires` → ISO-8601 UTC
-- `userAccountControl` → decoded flag list + booleans (`disabled`, `locked_out`, …)
-- `groupType` → `{scope: GLOBAL|DOMAIN_LOCAL|UNIVERSAL, security: bool, ...}`
-- `lockoutDuration` / `maxPwdAge` → ISO-8601 durations
-- `gPLink` → parsed list of GPO links with enforced/disabled flags
+---
+
+## `adcs-mcp` — Active Directory Certificate Services
+
+Tools are split by data source. AD-side tools work as soon as you have LDAPS
+to any DC and the `ADDS_*` vars set. WinRM-side tools additionally require the
+`ADCS_*` vars and WinRM listeners on each issuing CA.
+
+### AD-side (LDAPS to `CN=Public Key Services,CN=Configuration,DC=...`)
+
+| Tool                            | Description                                                          |
+|---------------------------------|----------------------------------------------------------------------|
+| `list_enrollment_services`      | Every Enterprise CA published in the domain                          |
+| `get_enrollment_service`        | Detailed attributes for a single Enterprise CA                       |
+| `list_root_cas`                 | Root CA certificates published as trust anchors                      |
+| `list_ntauth_cas`               | Contents of `CN=NTAuthCertificates` (CAs trusted for AD auth)        |
+| `list_certificate_templates`    | All templates, with flag decoding                                    |
+| `get_certificate_template`      | One template by displayName / cn / OID / DN                          |
+| `list_templates_by_eku`         | Templates that include a given EKU OID                               |
+| `find_templates_offered_by_ca`  | Templates a specific Enterprise CA is configured to issue            |
+| `list_aia_entries`              | Authority Information Access entries in AD                           |
+| `list_cdp_entries`              | CRL Distribution Points and published CRLs in AD                     |
+| `list_kra_certificates`         | Key Recovery Agent certificates in AD                                |
+| `list_pki_oids`                 | Custom OIDs registered under `CN=OID`                                |
+
+### WinRM-side (PowerShell / PSPKI on each online issuing CA)
+
+| Tool                              | Description                                                        |
+|-----------------------------------|--------------------------------------------------------------------|
+| `list_issued_certificates`        | Certificate DB rows with disposition = issued                      |
+| `list_pending_requests`           | Requests awaiting officer approval                                 |
+| `list_failed_requests`            | Failed / denied requests                                           |
+| `list_revoked_certificates`       | Revoked entries                                                    |
+| `get_certificate_by_serial`       | Full row + raw cert for a single serial                            |
+| `count_certificates_by_disposition` | Grouped counts across the CA DB                                  |
+| `get_ca_configuration`            | CRL/AIA/CDP settings, allowed templates, publication URIs          |
+| `list_ca_role_holders`            | CA ACL decoded (CA Admins, Certificate Managers, Auditors, …)      |
+| `list_officer_rights`             | Per-template certificate manager rights                            |
+| `get_ca_certificate_chain`        | The CA's own certificate chain (PEM)                               |
+| `list_ca_backup_settings`         | Registry-level CA config from `HKLM\...\CertSvc\Configuration`     |
+
+### Standalone
+
+| Tool                    | Description                                                              |
+|-------------------------|--------------------------------------------------------------------------|
+| `parse_certificate_pem` | Decode any PEM or base64 DER cert into JSON (SAN, EKU, key usage, chain) |
+
+### 3-tier PKI notes
+
+- **Tier 0 (offline Root)** and **Tier 1 (offline Policy)** aren't queried
+  directly — there's no live endpoint. Use `parse_certificate_pem` to inspect
+  any offline root/intermediate cert or CRL you export from them, and
+  cross-reference them with `list_ntauth_cas` / `list_aia_entries` /
+  `list_root_cas` to verify the domain still trusts them.
+- **Tier 2 (online Issuing CAs)** are the target of the WinRM-backed tools.
+  Provide their hostnames in `ADCS_CA_HOSTS` and grant the WinRM service
+  account read rights to the CA (typically membership in the CA's built-in
+  Auditor role on each issuing CA).
+
+---
 
 ## Requirements
 
 - Python 3.11+
-- Network access to a domain controller on port 636 (LDAPS) or 3269 (GC LDAPS)
-- A read-only bind account. Any authenticated domain user has enough rights for
-  the majority of queries; some (e.g. `msDS-PasswordSettings` for PSOs) need
-  additional read rights.
+- LDAPS reachable from wherever the servers run
+- For `adcs-mcp`: WinRM 5986 (HTTPS) reachable to each entry in
+  `ADCS_CA_HOSTS`, plus a WinRM service account with read rights on the CA
 
 ## Configuration
 
-Configuration is loaded from environment variables (or a `.env` file in the CWD).
+Configuration is loaded from environment variables (`.env` supported). See
+`.env.example` for the full list.
 
-| Variable                     | Required | Description                                                       |
-|------------------------------|----------|-------------------------------------------------------------------|
-| `ADDS_SERVERS`               | yes      | Comma-separated DC hostnames                                      |
-| `ADDS_PORT`                  | no       | LDAPS port (default `636`)                                        |
-| `ADDS_BIND_DN`               | yes      | Full DN of the read-only service account                          |
-| `ADDS_BIND_PASSWORD`         | yes      | Password for the service account                                  |
-| `ADDS_BASE_DN`               | yes      | Default search base (e.g. `DC=corp,DC=example,DC=com`)            |
-| `ADDS_DOMAIN`                | no       | DNS/NetBIOS domain name for display                               |
-| `ADDS_TLS_VALIDATE`          | no       | `true` (default) / `false` — validate DC cert                     |
-| `ADDS_CA_CERT_FILE`          | no       | Path to a CA bundle for TLS validation                            |
-| `ADDS_HTTP_HOST`             | no       | HTTP bind host (default `0.0.0.0`)                                |
-| `ADDS_HTTP_PORT`             | no       | HTTP bind port (default `8080`)                                   |
-| `ADDS_MAX_PAGE_SIZE`         | no       | Hard cap on rows per tool call (default `500`)                    |
-| `ADDS_DEFAULT_PAGE_SIZE`     | no       | Default page size for LDAP paged searches (default `50`)          |
-| `ADDS_QUERY_TIMEOUT_SECONDS` | no       | Per-query timeout (default `30`)                                  |
-| `ADDS_TRANSPORT`             | no       | `streamable-http` (default) or `stdio`                            |
-| `ADDS_LOG_LEVEL`             | no       | Python logging level (default `INFO`)                             |
-
-Copy `.env.example` to `.env` and fill in real values.
+`ADDS_*` variables are read by **both** servers (they share the LDAPS bind).
+`ADCS_*` variables are read only by `adcs-mcp`.
 
 ## Running
 
-Local dev (streamable HTTP on `:8080`):
+Install the package (add `[adcs]` extra for WinRM support):
 
 ```bash
-pip install -e .
-adds-mcp
+pip install -e .            # adds-mcp only
+pip install -e ".[adcs]"    # adds-mcp + adcs-mcp
 ```
 
-Docker:
+Run either server:
 
 ```bash
-docker build -t adds-mcp .
+adds-mcp    # HTTP :8080, endpoint /mcp
+adcs-mcp    # HTTP :8081, endpoint /mcp
+```
+
+Docker (two separate images):
+
+```bash
+docker build -t adds-mcp -f Dockerfile      .
+docker build -t adcs-mcp -f Dockerfile.adcs .
+
 docker run --rm -p 8080:8080 --env-file .env adds-mcp
+docker run --rm -p 8081:8081 --env-file .env adcs-mcp
 ```
-
-The server exposes the MCP streamable-HTTP endpoint at `/mcp`.
-
-## Security notes
-
-- The server never issues LDAP `add`, `modify`, `delete`, or `modifyDN` operations.
-  `read_only=True` is set on the ldap3 `Connection`, and none of the tools accept
-  write parameters.
-- Use a dedicated service account. Do not reuse a domain-admin credential.
-- LDAPS is required by default; set `ADDS_TLS_VALIDATE=false` only for lab work.
-- All LDAP filter inputs from tools are escaped with an RFC 4515-compliant helper
-  before hitting the server.
-- Result sets are capped by `ADDS_MAX_PAGE_SIZE` to keep responses bounded.
 
 ## Repository layout
 
 ```
-src/adds_mcp/
-  __init__.py
-  config.py         # Pydantic settings from env
-  client.py         # ldap3 wrapper: pooled LDAPS, paged searches, filter/DN escaping
-  formatting.py     # SID / GUID / FILETIME / UAC / groupType decoders
-  server.py         # FastMCP entrypoint (streamable-http by default)
-  tools/
-    _common.py      # Shared attribute sets
-    users.py
-    groups.py
-    ous.py
-    computers.py
-    gpos.py
-    domain.py
-    search.py       # Raw ldap_search + get_object_by_dn + count_objects
+src/
+  adds_mcp/          # AD DS server
+    __init__.py
+    config.py
+    client.py        # ldap3 wrapper, read_only=True, filter/DN escaping
+    formatting.py    # SID/GUID/FILETIME/UAC/groupType decoders
+    server.py
+    tools/           # users, groups, ous, computers, gpos, domain, search
+
+  adcs_mcp/          # ADCS server (reuses adds_mcp.client for LDAPS)
+    __init__.py
+    config.py
+    ldap_source.py   # Points reused ldap client at CN=Public Key Services
+    winrm_source.py  # pypsrp WinRM PowerShell runner (optional)
+    cert_utils.py    # X.509 parsing (cryptography)
+    server.py
+    tools/           # cas, templates, trust, issued, admin, parsing
 ```
