@@ -10,6 +10,7 @@ from mcp.server.fastmcp import FastMCP
 from adds_mcp.client import ReadOnlyADClient
 
 from .config import adcs_settings, adds_settings
+from .http_source import PkiWebClient
 from .ldap_source import ADCSLdapClient
 from .tools import register_all
 from .winrm_source import ReadOnlyWinRMClient
@@ -27,16 +28,20 @@ def build_server() -> FastMCP:
             "Use the AD-side tools (CAs, templates, trust anchors) for any question "
             "about what is published to the domain; use the WinRM-backed tools "
             "(issued/pending/revoked, ca configuration, role holders) to inspect the "
-            "certificate database and settings on online issuing CAs. Offline root "
-            "and policy CAs are not queried directly — use parse_certificate_pem to "
-            "decode certs or CRLs exported from them."
+            "certificate database and settings on online issuing CAs. Use the "
+            "web tools (fetch_crl, fetch_ca_certificate, check_crl_aia_endpoints) "
+            "to reach the CRL/AIA HTTP(S) distribution points a client would use "
+            "and confirm the published CRLs are current. Offline root and policy "
+            "CAs are not queried directly — use parse_certificate_pem or "
+            "parse_crl_pem to decode certs or CRLs exported from them."
         ),
         host=adcs_settings.http_host,
         port=adcs_settings.http_port,
     )
     ldap = ADCSLdapClient(ReadOnlyADClient(adds_settings))
     winrm = ReadOnlyWinRMClient(adcs_settings)
-    register_all(mcp, ldap, winrm)
+    web = PkiWebClient(adcs_settings)
+    register_all(mcp, ldap, winrm, web)
     return mcp
 
 

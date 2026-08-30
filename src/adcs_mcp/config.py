@@ -36,6 +36,15 @@ class ADCSSettings(BaseSettings):
     winrm_read_timeout: int = 60
     winrm_operation_timeout: int = 45
 
+    # CRL/AIA web server leg. Optional list of HTTP(S) CDP/AIA URLs to
+    # health-check (the http:// distribution points baked into issued certs).
+    crl_aia_urls: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    web_timeout: int = 20
+    web_tls_validate: bool = True
+    web_ca_cert_file: str = ""
+    # Max revoked entries to sample when summarising a fetched CRL.
+    web_max_crl_sample: int = 25
+
     # HTTP transport.
     http_host: str = "0.0.0.0"
     http_port: int = 8081
@@ -43,23 +52,23 @@ class ADCSSettings(BaseSettings):
     # Safety caps for CA database queries.
     max_certs_per_query: int = 500
 
-    @field_validator("ca_hosts", mode="before")
+    @field_validator("ca_hosts", "crl_aia_urls", mode="before")
     @classmethod
-    def _split_ca_hosts(cls, v: object) -> object:
+    def _split_csv(cls, v: object) -> object:
         if isinstance(v, str):
             return [s.strip() for s in v.split(",") if s.strip()]
         return v
 
     def require_winrm_ready(self) -> None:
-        missing = [
-            name
-            for name, value in {
-                "ADCS_CA_HOSTS": self.ca_hosts,
-                "ADCS_WINRM_USER": self.winrm_user,
-                "ADCS_WINRM_PASSWORD": self.winrm_password,
-            }.items()
-            if not value
-        ]
+        required = {
+            "ADCS_CA_HOSTS": self.ca_hosts,
+            "ADCS_WINRM_USER": self.winrm_user,
+        }
+        # A Kerberos keytab (or an ambient ticket cache) means no password is
+        # stored here; every other auth mode needs one.
+        if self.winrm_auth != "kerberos":
+            required["ADCS_WINRM_PASSWORD"] = self.winrm_password
+        missing = [name for name, value in required.items() if not value]
         if missing:
             raise RuntimeError(
                 "ADCS WinRM configuration missing: "

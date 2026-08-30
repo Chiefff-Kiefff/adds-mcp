@@ -53,8 +53,10 @@ class ReadOnlyWinRMClient:
         self._settings.require_winrm_ready()
         wsman = WSMan(
             host,
-            username=self._settings.winrm_user,
-            password=self._settings.winrm_password,
+            username=self._settings.winrm_user or None,
+            # Empty string would be sent as a literal password; None lets a
+            # Kerberos keytab / ticket cache supply the credential instead.
+            password=self._settings.winrm_password or None,
             auth=self._settings.winrm_auth,
             port=self._settings.winrm_port,
             ssl=self._settings.winrm_use_https,
@@ -64,6 +66,11 @@ class ReadOnlyWinRMClient:
         )
         with wsman, RunspacePool(wsman) as pool:
             yield pool
+
+    @property
+    def ca_hosts(self) -> list[str]:
+        """All issuing CA hosts configured via ADCS_CA_HOSTS."""
+        return list(self._settings.ca_hosts)
 
     def resolve_host(self, host: str | None) -> str:
         """Pick a CA host if the caller didn't specify one."""

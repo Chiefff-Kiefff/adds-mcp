@@ -8,6 +8,7 @@ a CA database dump over WinRM.
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 from typing import Any
 
 from cryptography import x509
@@ -15,6 +16,20 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509 import ExtensionNotFound
 from cryptography.x509.oid import ExtensionOID, NameOID
+
+# CRL entry revocation reason -> friendly label (RFC 5280 §5.3.1).
+CRL_REASON_NAMES = {
+    "unspecified": "Unspecified",
+    "key_compromise": "Key Compromise",
+    "ca_compromise": "CA Compromise",
+    "affiliation_changed": "Affiliation Changed",
+    "superseded": "Superseded",
+    "cessation_of_operation": "Cessation of Operation",
+    "certificate_hold": "Certificate Hold",
+    "privilege_withdrawn": "Privilege Withdrawn",
+    "aa_compromise": "AA Compromise",
+    "remove_from_crl": "Remove from CRL",
+}
 
 # Common EKU OID -> friendly name.
 EKU_NAMES = {
@@ -41,6 +56,27 @@ def _load_cert(raw: bytes) -> x509.Certificate:
     if raw[:1] == b"-":
         return x509.load_pem_x509_certificate(raw)
     return x509.load_der_x509_certificate(raw)
+
+
+def _load_crl(raw: bytes) -> x509.CertificateRevocationList:
+    if raw.lstrip()[:1] == b"-":
+        return x509.load_pem_x509_crl(raw)
+    return x509.load_der_x509_crl(raw)
+
+
+def _utc(cert_or_crl: Any, base: str) -> datetime | None:
+    """Return a tz-aware UTC datetime for a ``*_utc`` property with a fallback.
+
+    cryptography >= 42 exposes ``<base>_utc`` (already tz-aware). Older builds
+    only expose ``<base>`` as a naive UTC datetime, so normalise it ourselves.
+    """
+    value = getattr(cert_or_crl, f"{base}_utc", None)
+    if value is not None:
+        return value
+    value = getattr(cert_or_crl, base, None)
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 
 
 def _name_to_dict(name: x509.Name) -> dict[str, list[str]]:
@@ -168,4 +204,81 @@ def parse_certificate(raw: bytes) -> dict[str, Any]:
         "fingerprint_sha256": cert.fingerprint(hashes.SHA256()).hex(),
         "extensions": _extension_dict(cert),
         "pem": cert.public_bytes(Encoding.PEM).decode(),
+    }
+
+
+def _crl_number(crl: x509.CertificateRevocationList) -> int | None:
+    try:
+        return crl.extensions.get_extension_for_class(x509.CRLNumber).value.crl_number
+    except ExtensionNotFound:
+        return None
+
+
+def _crl_issuer_aki(crl: x509.CertificateRevocationList) -> str | None:
+    try:
+        aki = crl.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value
+    except ExtensionNotFound:
+        return None
+    return aki.key_identifier.hex() if aki.key_identifier else None
+
+
+def parse_crl(raw: bytes, sample_limit: int = 25) -> dict[str, Any]:
+    """Parse a DER- or PEM-encoded CRL into a JSON-friendly health summary.
+
+    Includes freshness fields (``this_update`` / ``next_update`` / ``is_expired``
+    / ``seconds_until_next_update``) so callers can tell at a glance whether a
+    published CRL is current, plus a capped sample of revoked entries.
+    """
+    crl = _load_crl(raw)
+    now = datetime.now(timezone.utc)
+    this_update = _utc(crl, "last_update")
+    next_update = _utc(crl, "next_update")
+
+    seconds_until_next = None
+    is_expired = None
+    if next_update is not None:
+        seconds_until_next = (next_update - now).total_seconds()
+        is_expired = seconds_until_next < 0
+
+    issuer_cn = None
+    try:
+        issuer_cn = crl.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+    except (IndexError, ValueError):
+        pass
+
+    revoked_count = len(crl)
+    sample: list[dict[str, Any]] = []
+    for entry in crl:
+        if len(sample) >= max(0, sample_limit):
+            break
+        reason = None
+        try:
+            reason_ext = entry.extensions.get_extension_for_class(x509.CRLReason).value
+            key = reason_ext.reason.name
+            reason = CRL_REASON_NAMES.get(key, key)
+        except ExtensionNotFound:
+            pass
+        revoked_at = _utc(entry, "revocation_date")
+        sample.append(
+            {
+                "serial_hex": format(entry.serial_number, "x"),
+                "revocation_date": revoked_at.isoformat() if revoked_at else None,
+                "reason": reason,
+            }
+        )
+
+    return {
+        "type": "crl",
+        "issuer_cn": issuer_cn,
+        "issuer": _name_to_dict(crl.issuer),
+        "crl_number": _crl_number(crl),
+        "authority_key_identifier": _crl_issuer_aki(crl),
+        "signature_algorithm": crl.signature_algorithm_oid._name,
+        "this_update": this_update.isoformat() if this_update else None,
+        "next_update": next_update.isoformat() if next_update else None,
+        "is_expired": is_expired,
+        "seconds_until_next_update": seconds_until_next,
+        "revoked_count": revoked_count,
+        "revoked_sample": sample,
+        "revoked_sample_truncated": revoked_count > len(sample),
     }

@@ -10,7 +10,55 @@ from pydantic import Field
 from ..winrm_source import ReadOnlyWinRMClient
 
 
+_HEALTH_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+$svc = Get-Service certsvc
+$out = [ordered]@{
+  ServiceStatus = "$($svc.Status)"
+  StartMode     = "$($svc.StartType)"
+}
+try {
+  Import-Module PSPKI -ErrorAction Stop
+  $ca = Get-CertificationAuthority | Select-Object -First 1
+  $out.Name         = $ca.Name
+  $out.ConfigString = $ca.ConfigString
+  $out.Type         = "$($ca.Type)"
+  $out.IsAccessible = $ca.IsAccessible
+} catch {
+  $out.PSPKIError = "$($_.Exception.Message)"
+}
+$out | ConvertTo-Json -Depth 4 -Compress
+"""
+
+
 def register(mcp: FastMCP, winrm: ReadOnlyWinRMClient) -> None:
+    @mcp.tool(
+        annotations={
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        },
+    )
+    def check_ca_hosts_health() -> dict[str, Any]:
+        """Report certsvc status and reachability for every host in ADCS_CA_HOSTS.
+
+        Fans out over all configured issuing CAs (e.g. CA-ISSUE01 and CA-ISSUE02)
+        so you can see at a glance which CAs are online and responding to WinRM.
+        """
+        hosts = winrm.ca_hosts
+        if not hosts:
+            return {"checked": 0, "results": [], "note": "ADCS_CA_HOSTS is empty."}
+        results: list[dict[str, Any]] = []
+        for host in hosts:
+            try:
+                res = winrm.run_script(_HEALTH_SCRIPT, host=host)
+                results.append({"host": host, "ok": True, "ca": res.get("result")})
+            except Exception as exc:  # noqa: BLE001 — surface per-host failure
+                results.append({"host": host, "ok": False, "error": str(exc)})
+        online = sum(1 for r in results if r["ok"])
+        return {"checked": len(results), "online": online, "results": results}
+
     @mcp.tool(
         annotations={
             "readOnlyHint": True,
