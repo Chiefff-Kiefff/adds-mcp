@@ -7,7 +7,7 @@ monitoring, investigation, and answering "who / what / where" questions about
 a Windows domain without ever mutating directory state.
 
 - **`adds-mcp`** — AD DS: users, groups, OUs, computers, GPOs, domain metadata
-- **`adcs-mcp`** — AD CS: CAs, certificate templates, issued/pending/revoked certs, CA config
+- **`adcs-mcp`** — AD CS: CAs, certificate templates, issued/pending/revoked certs, CA config, and the CRL/AIA web endpoints clients fetch over HTTP(S)
 - **`addns-mcp`** — AD-integrated DNS: zones, records, delegations, stale entries, IP/name search
 
 Every tool has `readOnlyHint: true`. `adds-mcp` opens LDAP with
@@ -56,32 +56,42 @@ reads on the CA hosts.
                 │       │             │             │              │
                 │       └──────┬──────┴──────┬──────┘              │
                 │              │             │                     │
-                │       ┌──────▼─────┐  ┌────▼──────┐              │
-                │       │  LDAPS 636 │  │ WinRM 5986│              │
-                │       │  (shared)  │  │  (Kerberos│              │
-                │       │            │  │   or NTLM)│              │
-                │       └──────┬─────┘  └────┬──────┘              │
-                └──────────────┼─────────────┼─────────────────────┘
-                               │             │
-                               │             │
-              ┌────────────────▼───┐   ┌─────▼────────────────┐
-              │                    │   │                      │
-              │  Domain Controllers│   │ Issuing / Enterprise │
-              │   (any DC — pool)  │   │ CAs listed in        │
-              │                    │   │ ADCS_CA_HOSTS        │
-              │  • adds-mcp        │   │                      │
-              │  • adcs-mcp (AD    │   │  • adcs-mcp only     │
-              │      PKI subtree)  │   │  • PowerShell + PSPKI│
-              │  • addns-mcp       │   │                      │
-              │                    │   │  ⚠ NOT the offline   │
-              │                    │   │    Root/Policy CAs   │
-              └────────────────────┘   └──────────────────────┘
+                │    ┌────────▼───┐ ┌───▼──────┐ ┌───▼──────┐     │
+                │    │  LDAPS 636 │ │WinRM 5986│ │ HTTP(S)  │     │
+                │    │  (shared)  │ │ (Kerberos│ │ CRL/AIA  │     │
+                │    │            │ │  or NTLM)│ │  fetch   │     │
+                │    └──────┬─────┘ └────┬─────┘ └────┬─────┘     │
+                └───────────┼────────────┼────────────┼──────────┘
+                            │            │            │
+          ┌─────────────────▼─┐  ┌───────▼──────┐  ┌──▼───────────────┐
+          │                   │  │ Issuing /    │  │ CRL / AIA web    │
+          │ Domain Controllers│  │ Enterprise   │  │ server (CDP/AIA  │
+          │  (any DC — pool)  │  │ CAs listed in │  │ HTTP endpoints   │
+          │                   │  │ ADCS_CA_HOSTS │  │ in ADCS_CRL_     │
+          │  • adds-mcp       │  │              │  │ AIA_URLS)        │
+          │  • adcs-mcp (AD   │  │ • adcs-mcp   │  │                  │
+          │      PKI subtree) │  │ • PS + PSPKI │  │ • adcs-mcp only  │
+          │  • addns-mcp      │  │ • CA-ISSUE01 │  │ • fetch_crl /    │
+          │                   │  │   CA-ISSUE02 │  │   fetch_ca_cert  │
+          │                   │  │ ⚠ NOT offline│  │ • check_crl_aia_ │
+          │                   │  │  Root/Policy │  │   endpoints      │
+          └───────────────────┘  └──────────────┘  └──────────────────┘
 ```
 
+This maps one-to-one onto the classic AD CS insight topology:
+
+| Leg | Transport | Reaches | Tools |
+|-----|-----------|---------|-------|
+| AD directory | LDAP(S) 636 | Domain Controllers (PKI subtree) | `list_root_cas`, `list_aia_entries`, `list_cdp_entries`, `list_certificate_templates`, … |
+| Issuing CAs | Kerberos/WinRM 5986 | `CA-ISSUE01`, `CA-ISSUE02` (`ADCS_CA_HOSTS`) | `check_ca_hosts_health`, `list_issued_certificates`, `get_ca_configuration`, … |
+| CRL/AIA web | HTTP(S) | CRL/AIA distribution web server | `fetch_crl`, `fetch_ca_certificate`, `check_crl_aia_endpoints` |
+| Policy/Root CA | *(offline — optional)* | Exported certs/CRLs only | `parse_certificate_pem`, `parse_crl_pem` |
+
 **Not queried live**: Tier 0 (offline Root) and Tier 1 (offline Policy) CAs.
-There's no live endpoint on an offline CA. Use `parse_certificate_pem` on
-exported certs/CRLs from those tiers instead, then cross-check the trust chain
-against `list_ntauth_cas` / `list_aia_entries` / `list_root_cas`.
+There's no live endpoint on an offline CA. Use `parse_certificate_pem` /
+`parse_crl_pem` on exported certs/CRLs from those tiers instead, then
+cross-check the trust chain against `list_ntauth_cas` / `list_aia_entries` /
+`list_root_cas`.
 
 ---
 
@@ -126,7 +136,7 @@ they just return `null` where the account lacks read rights.
 
 **Used by:** the WinRM-side tools in `adcs-mcp`
 (`list_issued_certificates`, `get_ca_configuration`, `list_ca_role_holders`, …).
-Roughly half of `adcs-mcp`'s 24 tools. If you never call those tools, you
+Roughly a third of `adcs-mcp`'s 29 tools. If you never call those tools, you
 don't need this account at all.
 
 **Purpose:** Run `Get-*` PowerShell (mostly the `PSPKI` module) on each online
@@ -162,6 +172,7 @@ deploying inside a segmented environment, this is the firewall ask.
 | MCP host            | Every DC (or a load-balanced VIP)   | TCP TLS  | **636**   | `adds-mcp`, `adcs-mcp` (AD-side), `addns-mcp` |
 | MCP host            | DCs (Global Catalog, optional)      | TCP TLS  | 3269  | Not required for any current tool               |
 | MCP host            | Each issuing CA in `ADCS_CA_HOSTS`  | TCP TLS  | **5986**  | `adcs-mcp` (WinRM-side tools)                 |
+| MCP host            | CRL/AIA web server (`ADCS_CRL_AIA_URLS`) | TCP  | **80 / 443** | `adcs-mcp` (`fetch_crl`, `fetch_ca_certificate`, `check_crl_aia_endpoints`) |
 | MCP host            | KDCs (usually the DCs)              | TCP+UDP  | 88    | Only if `ADCS_WINRM_AUTH=kerberos`              |
 | MCP host            | KDCs (Kerberos password change)     | TCP+UDP  | 464   | Only if you actively rotate the keytab from Linux |
 | MCP host            | Internal DNS resolvers              | UDP/TCP  | 53    | To resolve DC + CA hostnames (and Kerberos)     |
@@ -205,8 +216,9 @@ in `ADDS_SERVERS` and it will fail over.
 
 ### `adcs-mcp` — Active Directory Certificate Services
 
-Split into two data-source halves. Both halves share the `adcs-mcp` process,
-but you can leave the WinRM half unconfigured if you only need AD-side reads.
+Split into three data-source halves. All share the `adcs-mcp` process, but each
+is independent: you can leave the WinRM half or the web half unconfigured and
+still use the AD-side reads.
 
 #### AD-side half (LDAPS to any DC)
 
@@ -240,6 +252,7 @@ Tools in this half:
 
 | Tool | PowerShell it runs | Requires on the CA |
 |------|-------------------|---------------------|
+| `check_ca_hosts_health` | `Get-Service certsvc` + `Get-CertificationAuthority` per host, fanned out over all of `ADCS_CA_HOSTS` | PSPKI; WinRM listen (Auditor optional) |
 | `list_issued_certificates` | `Get-CertificationAuthority \| Get-IssuedRequest` (PSPKI) | PSPKI installed; CA Auditor role |
 | `list_pending_requests` | ` `` `                                                     | ` `` `                             |
 | `list_failed_requests` | ` `` `                                                     | ` `` `                             |
@@ -252,9 +265,31 @@ Tools in this half:
 | `get_ca_certificate_chain` | `Get-CertificationAuthorityCertificate`                | PSPKI; CA Auditor |
 | `list_ca_backup_settings` | `Get-ItemProperty HKLM:\...\CertSvc\Configuration`      | Read on the CertSvc config registry (usually implied by CA Auditor) |
 
+#### Web half (HTTP(S) to the CRL/AIA distribution points)
+
+Issued certificates carry CDP and AIA extensions pointing at HTTP(S) URLs
+(`http://pki.corp.example.com/crl/...`, `.../aia/...`). Clients fetch those to
+check revocation and build chains. This half reaches the same endpoints a
+client would, so you can confirm they're reachable and the CRL they serve is
+current — something the LDAP view (what AD *publishes*) and the WinRM view
+(what the CA *holds*) can't tell you.
+
+| Tool | What it does | Notes |
+|------|--------------|-------|
+| `fetch_crl` | GET a CRL URL, decode it, report `this_update` / `next_update` / `is_expired` / revoked count | Accepts DER or PEM CRLs |
+| `fetch_ca_certificate` | GET a CA cert from an AIA URL and decode it | `.crt` / `.cer`, DER or PEM |
+| `check_crl_aia_endpoints` | Probe every URL in `ADCS_CRL_AIA_URLS` (or a passed list) for reachability + CRL freshness | One row per endpoint; per-URL errors don't abort the batch |
+
+**Servers this hits:** the CRL/AIA web server(s) named in `ADCS_CRL_AIA_URLS`
+(typically an IIS site or load-balanced VIP), over ports 80/443. TLS
+validation follows `ADCS_WEB_TLS_VALIDATE` / `ADCS_WEB_CA_CERT_FILE`.
+
 **Standalone half (no directory or WinRM access):**
 - `parse_certificate_pem` — pure `cryptography` X.509 decode. Feed it any PEM
-  or base64 DER (including CRLs and offline Root/Policy CA certs).
+  or base64 DER (including offline Root/Policy CA certs).
+- `parse_crl_pem` — decode a CRL exported from an offline Root/Policy CA
+  (PEM `-----BEGIN X509 CRL-----` or base64 DER) with the same freshness
+  summary as `fetch_crl`.
 
 **Servers this hits:** every host you list in `ADCS_CA_HOSTS`. Typically your
 two-or-more online Enterprise/Issuing CAs. Not the offline root or policy
@@ -381,9 +416,12 @@ CAs on 5986 is enough.
 ```bash
 git clone https://github.com/<your-org>/ms-ad-mcp.git
 cd ms-ad-mcp
-pip install -e .            # adds-mcp + addns-mcp (LDAP only)
+pip install -e .            # adds-mcp, addns-mcp, and adcs-mcp's AD + web halves
 pip install -e ".[adcs]"    # adds pypsrp/kerberos deps for adcs-mcp's WinRM half
 ```
+
+The base install already covers `adcs-mcp`'s AD-side (LDAP) and CRL/AIA web
+(`requests`) halves; the `[adcs]` extra is only needed for the WinRM half.
 
 Or use the pinned images:
 
@@ -437,6 +475,20 @@ All configuration is environment-driven and supports `.env` files. Copy
 | `ADCS_HTTP_PORT` |   | `8081` | Bind port for `adcs-mcp`. |
 | `ADCS_TRANSPORT` |   | `streamable-http` | Same as `ADDS_TRANSPORT`. |
 | `ADCS_LOG_LEVEL` |   | `INFO` | |
+
+### adcs-mcp CRL/AIA web settings
+
+Only needed for the web half (`fetch_crl`, `fetch_ca_certificate`,
+`check_crl_aia_endpoints`). All optional — the fetch tools take an explicit URL,
+so these only set defaults and TLS behavior.
+
+| Variable | Required | Default | Description |
+|----------|:--------:|---------|-------------|
+| `ADCS_CRL_AIA_URLS` |   | — | Comma-separated CDP/AIA HTTP(S) URLs `check_crl_aia_endpoints` probes when called with no arguments. |
+| `ADCS_WEB_TIMEOUT` |   | `20` | Per-fetch timeout in seconds. |
+| `ADCS_WEB_TLS_VALIDATE` |   | `true` | Validate TLS on `https://` endpoints. `false` only for lab work. |
+| `ADCS_WEB_CA_CERT_FILE` |   | — | Optional CA bundle for validating the web server cert. |
+| `ADCS_WEB_MAX_CRL_SAMPLE` |   | `25` | Max revoked entries sampled per CRL summary. |
 
 ### addns-mcp settings
 
@@ -606,7 +658,7 @@ scope + security/distribution, `lockoutDuration` / `maxPwdAge` → ISO-8601
 durations, `gPLink` → structured list of GPO links with enforced/disabled
 flags.
 
-### `adcs-mcp` — 24 tools
+### `adcs-mcp` — 29 tools
 
 **AD-side (LDAPS):**
 `list_enrollment_services`, `get_enrollment_service`, `list_root_cas`,
@@ -615,15 +667,19 @@ flags.
 `list_cdp_entries`, `list_kra_certificates`, `list_pki_oids`.
 
 **WinRM-side (PowerShell + PSPKI):**
-`list_issued_certificates`, `list_pending_requests`, `list_failed_requests`,
-`list_revoked_certificates`, `get_certificate_by_serial`,
+`check_ca_hosts_health`, `list_issued_certificates`, `list_pending_requests`,
+`list_failed_requests`, `list_revoked_certificates`, `get_certificate_by_serial`,
 `count_certificates_by_disposition`, `get_ca_configuration`,
 `list_ca_role_holders`, `list_officer_rights`, `get_ca_certificate_chain`,
 `list_ca_backup_settings`.
 
+**Web-side (HTTP(S) to CRL/AIA endpoints):**
+`fetch_crl`, `fetch_ca_certificate`, `check_crl_aia_endpoints`.
+
 **Standalone:**
 `parse_certificate_pem` — decode any PEM or base64 DER cert
-(subject/issuer/EKU/SAN/key usage/fingerprints/PEM).
+(subject/issuer/EKU/SAN/key usage/fingerprints/PEM). `parse_crl_pem` — decode
+a PEM/DER CRL (issuer, this/next update, revoked entries).
 
 ### `addns-mcp` — 9 tools
 
